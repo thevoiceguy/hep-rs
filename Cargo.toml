@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/hep-rs"]
+
+[workspace.package]
+version      = "0.0.1"
+edition      = "2021"
+rust-version = "1.78"
+license      = "MIT OR Apache-2.0"
+authors      = ["thevoiceguy"]
+repository   = "https://github.com/thevoiceguy/hep-rs"
+homepage     = "https://github.com/thevoiceguy/hep-rs"
+description  = "HEP3 (Homer Encapsulation Protocol v3) codec and transport for Rust."
+keywords     = ["sip", "voip", "hep", "homer", "observability"]
+categories   = ["network-programming", "encoding"]
+
+[workspace.dependencies]
+# Runtime
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+
+# Errors / logging
+thiserror = "2.0"
+tracing   = "0.1"
+
+# Encoding
+bytes = "1.10"
+
+# Dev only
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto       = "thin"

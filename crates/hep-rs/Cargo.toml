@@ -1,0 +1,29 @@
+[package]
+name        = "hep-rs"
+description = "HEP3 (Homer Encapsulation Protocol v3) codec and transport."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+keywords.workspace     = true
+categories.workspace   = true
+
+[features]
+default = ["transport-udp"]
+# UDP transport — the dominant deployment mode for Homer. Pure stdlib +
+# tokio, no extra deps. Disable to drop the worker task code if you only
+# need the codec.
+transport-udp = []
+
+[dependencies]
+bytes.workspace     = true
+thiserror.workspace = true
+tracing.workspace   = true
+tokio = { workspace = true, optional = false }
+
+[dev-dependencies]
+tokio      = { workspace = true, features = ["test-util"] }
+tokio-test.workspace = true
