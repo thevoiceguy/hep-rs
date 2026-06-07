@@ -93,6 +93,11 @@ pub enum HepProtocol {
     /// 0x65 (101) — Call Detail Record. Vendor convention used by
     /// siphon-ai for end-of-call summaries.
     Cdr = 101,
+    /// 0x66 (102) — STIR/SHAKEN verification verdict (`verstat`). Vendor
+    /// convention used by siphon-ai: one chunk emitted per inbound call when
+    /// verification is enabled, payload is the verdict as JSON, correlated by
+    /// call_id so Homer threads it through the same SIP + RTCP view.
+    Verstat = 102,
 }
 
 impl HepProtocol {
@@ -120,6 +125,7 @@ impl HepProtocol {
             34 => Self::Mos,
             100 => Self::Log,
             101 => Self::Cdr,
+            102 => Self::Verstat,
             _ => return None,
         })
     }
@@ -157,5 +163,37 @@ impl IpProto {
     /// Wire byte.
     pub fn as_u8(self) -> u8 {
         self as u8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hep_protocol_roundtrips_through_wire_byte() {
+        for p in [
+            HepProtocol::Sip,
+            HepProtocol::Rtcp,
+            HepProtocol::RtpQos,
+            HepProtocol::Mos,
+            HepProtocol::Log,
+            HepProtocol::Cdr,
+            HepProtocol::Verstat,
+        ] {
+            assert_eq!(HepProtocol::from_u8(p.as_u8()), Some(p));
+        }
+    }
+
+    #[test]
+    fn verstat_is_wire_value_102() {
+        // Wire-stable: 0x66. Locked so a future renumber is a visible diff.
+        assert_eq!(HepProtocol::Verstat.as_u8(), 102);
+        assert_eq!(HepProtocol::from_u8(102), Some(HepProtocol::Verstat));
+    }
+
+    #[test]
+    fn unknown_protocol_byte_is_none() {
+        assert_eq!(HepProtocol::from_u8(250), None);
     }
 }
