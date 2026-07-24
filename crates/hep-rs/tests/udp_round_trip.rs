@@ -109,3 +109,84 @@ async fn full_queue_drops_count_correctly() {
         .expect("worker exits")
         .expect("join");
 }
+
+/// Graceful `shutdown()` flushes packets still queued and lets the
+/// worker exit cleanly — the property an embedder needs so a records
+/// pipeline doesn't lose its final CDRs at process shutdown when the
+/// producer side is held alive by immortal emitter clones (which is
+/// why dropping the sink isn't a usable teardown for them).
+///
+/// A slow reader forces a backlog: we enqueue many packets against a
+/// collector that only starts reading *after* we've signalled
+/// shutdown, so the drain path — not steady-state delivery — is what
+/// gets them across.
+#[tokio::test]
+async fn shutdown_flushes_the_queued_backlog() {
+    let collector = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let collector_addr: SocketAddr = collector.local_addr().unwrap();
+
+    // Queue big enough to hold the whole burst without dropping.
+    let mut cfg = UdpHepSinkConfig::new(collector_addr);
+    cfg.queue_capacity = 256;
+    let (sink, worker) = UdpHepSink::start(cfg).await.expect("start sink");
+
+    // A long-lived clone stands in for a process-wide emitter: it keeps
+    // a sender alive, so the channel would NEVER close on its own.
+    // Only `shutdown()` can drain the worker while this exists.
+    let _immortal = sink.clone();
+
+    const N: usize = 100;
+    for _ in 0..N {
+        sink.send(sample_packet());
+    }
+    assert_eq!(sink.drops(), 0, "queue was sized to hold the burst");
+
+    // Signal graceful shutdown, then await the worker. The worker
+    // closes its receiver and flushes the backlog before exiting.
+    sink.shutdown();
+    timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("worker drains and exits within 5s")
+        .expect("worker join");
+
+    // Every queued packet was sent, despite the immortal sender clone.
+    assert_eq!(
+        sink.sent(),
+        N as u64,
+        "all queued packets flushed on shutdown"
+    );
+
+    // And the collector can actually receive them (they're on the wire,
+    // not just counted). Drain what's buffered on the socket.
+    let mut received = 0;
+    let mut buf = vec![0u8; 4096];
+    while received < N {
+        match timeout(Duration::from_secs(1), collector.recv_from(&mut buf)).await {
+            Ok(Ok(_)) => received += 1,
+            _ => break,
+        }
+    }
+    assert_eq!(received, N, "collector received the full flushed backlog");
+}
+
+/// After `shutdown()`, further `send`s are refused (counted as drops),
+/// not silently accepted into a dead queue.
+#[tokio::test]
+async fn send_after_shutdown_is_dropped_not_lost_silently() {
+    let collector = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    let collector_addr: SocketAddr = collector.local_addr().unwrap();
+    let (sink, worker) = UdpHepSink::start(UdpHepSinkConfig::new(collector_addr))
+        .await
+        .expect("start sink");
+
+    sink.shutdown();
+    timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("worker exits")
+        .expect("join");
+
+    // The receiver is closed; a post-shutdown send can't be queued.
+    sink.send(sample_packet());
+    assert_eq!(sink.sent(), 0);
+    assert_eq!(sink.drops(), 1, "post-shutdown send is a drop, not a wedge");
+}
