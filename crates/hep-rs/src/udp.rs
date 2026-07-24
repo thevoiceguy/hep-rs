@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -82,13 +82,17 @@ pub struct UdpHepSink {
     tx: mpsc::Sender<HepPacket>,
     drops: Arc<AtomicU64>,
     sent: Arc<AtomicU64>,
+    /// Signals the worker to close its receiver and flush whatever is
+    /// still queued before exiting — see [`UdpHepSink::shutdown`].
+    shutdown: Arc<Notify>,
 }
 
 impl UdpHepSink {
     /// Bind a local UDP socket, spawn the worker task, and return a
-    /// handle. The worker runs until the [`UdpHepSink`] (and every
-    /// clone of it) is dropped — the closing channel triggers a
-    /// graceful exit. The returned [`JoinHandle`] lets callers await
+    /// handle. The worker runs until either every [`UdpHepSink`] clone
+    /// is dropped (the channel closes) or [`shutdown`](Self::shutdown)
+    /// is called — both drain whatever is queued before exiting. The
+    /// returned [`JoinHandle`] lets callers await
     /// the worker on shutdown if they want a deterministic teardown.
     pub async fn start(cfg: UdpHepSinkConfig) -> Result<(Self, JoinHandle<()>), UdpHepSinkError> {
         // Bind 0:0 (UDP, family matching the collector). The
@@ -106,6 +110,7 @@ impl UdpHepSink {
         let (tx, rx) = mpsc::channel(cfg.queue_capacity);
         let drops = Arc::new(AtomicU64::new(0));
         let sent = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(Notify::new());
 
         let worker = Worker {
             socket,
@@ -113,10 +118,38 @@ impl UdpHepSink {
             collector: cfg.collector,
             sent: Arc::clone(&sent),
             warn_throttle: cfg.warn_throttle,
+            shutdown: Arc::clone(&shutdown),
         };
         let handle = tokio::spawn(worker.run());
 
-        Ok((Self { tx, drops, sent }, handle))
+        Ok((
+            Self {
+                tx,
+                drops,
+                sent,
+                shutdown,
+            },
+            handle,
+        ))
+    }
+
+    /// Ask the worker to stop accepting new packets and flush whatever
+    /// is already queued, then exit — a *graceful* teardown, as opposed
+    /// to aborting the worker task (which discards the queue).
+    ///
+    /// The worker closes its receiver on this signal, so any packet
+    /// still buffered is sent before the [`JoinHandle`] returned by
+    /// [`start`](Self::start) completes; `send` calls that race the
+    /// close are counted as [`drops`](Self::drops). Await that handle
+    /// after calling this for a deterministic drain (bound it with a
+    /// timeout if a wedged collector must not delay shutdown).
+    ///
+    /// Idempotent and cheap. Signalling matters because the producer
+    /// side is often held alive by long-lived clones (e.g. process-wide
+    /// emitters), so the channel would never close on its own — dropping
+    /// every `UdpHepSink` is not a teardown an embedder can rely on.
+    pub fn shutdown(&self) {
+        self.shutdown.notify_one();
     }
 
     /// Number of packets the producer side has dropped due to a full
@@ -140,6 +173,7 @@ impl Clone for UdpHepSink {
             tx: self.tx.clone(),
             drops: Arc::clone(&self.drops),
             sent: Arc::clone(&self.sent),
+            shutdown: Arc::clone(&self.shutdown),
         }
     }
 }
@@ -158,6 +192,7 @@ struct Worker {
     collector: SocketAddr,
     sent: Arc<AtomicU64>,
     warn_throttle: Duration,
+    shutdown: Arc<Notify>,
 }
 
 impl Worker {
@@ -167,35 +202,70 @@ impl Worker {
         // monotonic clock independent of wall time skew.
         let mut last_warn: Option<tokio::time::Instant> = None;
 
-        while let Some(packet) = self.rx.recv().await {
-            let buf = packet.encode();
-            match self.socket.send(&buf).await {
-                Ok(_) => {
-                    self.sent.fetch_add(1, Ordering::Relaxed);
+        loop {
+            tokio::select! {
+                // Prefer the shutdown signal so a caller that has
+                // stopped producing gets a bounded, deterministic drain
+                // rather than racing the recv arm indefinitely.
+                biased;
+                _ = self.shutdown.notified() => {
+                    // Close the receiver so no further packet is
+                    // accepted (producers still holding a `tx` clone —
+                    // e.g. process-wide emitters — now see `send` fail
+                    // and count a drop), then flush everything already
+                    // queued and exit. This is why `close()` is the
+                    // teardown primitive, not "drop all senders": the
+                    // senders may be immortal, but the receiver is ours.
+                    self.rx.close();
+                    while let Some(packet) = self.rx.recv().await {
+                        self.send_one(packet, &mut last_warn).await;
+                    }
+                    debug!(collector = %self.collector, "HEP UDP worker drained and exiting (shutdown)");
+                    return;
                 }
-                Err(e) => {
-                    let now = tokio::time::Instant::now();
-                    let should_warn = match last_warn {
-                        Some(prev) => now.duration_since(prev) >= self.warn_throttle,
-                        None => true,
-                    };
-                    if should_warn {
-                        warn!(
-                            collector = %self.collector,
-                            error = %e,
-                            "HEP UDP send failed; further failures suppressed until throttle elapses"
-                        );
-                        last_warn = Some(now);
-                    } else {
-                        debug!(
-                            collector = %self.collector,
-                            error = %e,
-                            "HEP UDP send failed (suppressed)"
-                        );
+                maybe = self.rx.recv() => {
+                    match maybe {
+                        Some(packet) => self.send_one(packet, &mut last_warn).await,
+                        // Every sender dropped: the pre-existing graceful
+                        // exit. Buffered packets have already been drained
+                        // by `recv` returning them before `None`.
+                        None => {
+                            debug!(collector = %self.collector, "HEP UDP worker exiting (sender dropped)");
+                            return;
+                        }
                     }
                 }
             }
         }
-        debug!(collector = %self.collector, "HEP UDP worker exiting (sender dropped)");
+    }
+
+    async fn send_one(&self, packet: HepPacket, last_warn: &mut Option<tokio::time::Instant>) {
+        let buf = packet.encode();
+        match self.socket.send(&buf).await {
+            Ok(_) => {
+                self.sent.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                let now = tokio::time::Instant::now();
+                let should_warn = match *last_warn {
+                    Some(prev) => now.duration_since(prev) >= self.warn_throttle,
+                    None => true,
+                };
+                if should_warn {
+                    warn!(
+                        collector = %self.collector,
+                        error = %e,
+                        "HEP UDP send failed; further failures suppressed until throttle elapses"
+                    );
+                    *last_warn = Some(now);
+                } else {
+                    debug!(
+                        collector = %self.collector,
+                        error = %e,
+                        "HEP UDP send failed (suppressed)"
+                    );
+                }
+            }
+        }
     }
 }
