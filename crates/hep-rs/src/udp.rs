@@ -82,6 +82,7 @@ pub struct UdpHepSink {
     tx: mpsc::Sender<HepPacket>,
     drops: Arc<AtomicU64>,
     sent: Arc<AtomicU64>,
+    send_failures: Arc<AtomicU64>,
     /// Signals the worker to close its receiver and flush whatever is
     /// still queued before exiting — see [`UdpHepSink::shutdown`].
     shutdown: Arc<Notify>,
@@ -110,6 +111,7 @@ impl UdpHepSink {
         let (tx, rx) = mpsc::channel(cfg.queue_capacity);
         let drops = Arc::new(AtomicU64::new(0));
         let sent = Arc::new(AtomicU64::new(0));
+        let send_failures = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(Notify::new());
 
         let worker = Worker {
@@ -117,6 +119,7 @@ impl UdpHepSink {
             rx,
             collector: cfg.collector,
             sent: Arc::clone(&sent),
+            send_failures: Arc::clone(&send_failures),
             warn_throttle: cfg.warn_throttle,
             shutdown: Arc::clone(&shutdown),
         };
@@ -127,6 +130,7 @@ impl UdpHepSink {
                 tx,
                 drops,
                 sent,
+                send_failures,
                 shutdown,
             },
             handle,
@@ -165,6 +169,27 @@ impl UdpHepSink {
     pub fn sent(&self) -> u64 {
         self.sent.load(Ordering::Relaxed)
     }
+
+    /// Number of packets the worker dequeued but could not put on the
+    /// wire — `send` returned an error. Monotonic.
+    ///
+    /// On a *connected* UDP socket the kernel reports an ICMP port
+    /// unreachable from a dead collector as an error on a **subsequent**
+    /// send, so against a collector that is down and answering with
+    /// ICMP this climbs at roughly half the packet rate while
+    /// [`sent`](Self::sent) climbs at the other half. A collector that
+    /// is black-holed (no ICMP, e.g. behind a firewall that drops
+    /// silently) produces no failures at all — UDP cannot tell. Movement
+    /// here is therefore a sufficient but not necessary sign that the
+    /// collector is unreachable; the embedder derives its "collector
+    /// up" signal from whether this counter moved over a window.
+    ///
+    /// Together with [`drops`](Self::drops) (queue full, never
+    /// dequeued) and `sent`, every packet handed to [`HepSink::send`]
+    /// lands in exactly one of the three.
+    pub fn send_failures(&self) -> u64 {
+        self.send_failures.load(Ordering::Relaxed)
+    }
 }
 
 impl Clone for UdpHepSink {
@@ -173,6 +198,7 @@ impl Clone for UdpHepSink {
             tx: self.tx.clone(),
             drops: Arc::clone(&self.drops),
             sent: Arc::clone(&self.sent),
+            send_failures: Arc::clone(&self.send_failures),
             shutdown: Arc::clone(&self.shutdown),
         }
     }
@@ -191,6 +217,7 @@ struct Worker {
     rx: mpsc::Receiver<HepPacket>,
     collector: SocketAddr,
     sent: Arc<AtomicU64>,
+    send_failures: Arc<AtomicU64>,
     warn_throttle: Duration,
     shutdown: Arc<Notify>,
 }
@@ -246,6 +273,9 @@ impl Worker {
                 self.sent.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
+                // Counted before the throttled log so the embedder's
+                // metric moves on every failure, not once per window.
+                self.send_failures.fetch_add(1, Ordering::Relaxed);
                 let now = tokio::time::Instant::now();
                 let should_warn = match *last_warn {
                     Some(prev) => now.duration_since(prev) >= self.warn_throttle,
