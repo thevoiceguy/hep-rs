@@ -190,3 +190,47 @@ async fn send_after_shutdown_is_dropped_not_lost_silently() {
     assert_eq!(sink.sent(), 0);
     assert_eq!(sink.drops(), 1, "post-shutdown send is a drop, not a wedge");
 }
+
+/// A collector that is *down* answers each datagram with an ICMP port
+/// unreachable, which a connected UDP socket surfaces as an error on a
+/// later `send`. Those sends are counted in `send_failures`, so an
+/// embedder can derive "collector down" from the counter rather than
+/// from a throttled log line (siphon-ai #596).
+#[tokio::test]
+async fn sends_refused_by_a_dead_collector_are_counted() {
+    // Bind to learn a free port, then release it: nothing listens there.
+    let probe = UdpSocket::bind("127.0.0.1:0").await.expect("bind probe");
+    let dead: SocketAddr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let mut cfg = UdpHepSinkConfig::new(dead);
+    cfg.warn_throttle = Duration::from_secs(3600);
+    let (sink, worker) = UdpHepSink::start(cfg).await.expect("start sink");
+
+    // Several sends, spaced so the kernel has delivered the ICMP
+    // refusal for one before the next goes out; on Linux the failure
+    // lands on the send *after* the refused one.
+    for _ in 0..8 {
+        sink.send(sample_packet());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sink.send_failures() == 0 && tokio::time::Instant::now() < deadline {
+        sink.send(sample_packet());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        sink.send_failures() > 0,
+        "a dead collector must produce send failures (sent={}, drops={})",
+        sink.sent(),
+        sink.drops()
+    );
+    assert_eq!(sink.drops(), 0, "nothing was refused by the queue");
+
+    drop(sink);
+    timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("worker exits within 1s")
+        .expect("worker join");
+}
